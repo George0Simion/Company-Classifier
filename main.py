@@ -4,23 +4,12 @@ import numpy
 import pandas as pd
 import re
 import numpy as np
+from collections import deque
 
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.metrics import f1_score
-
-
-# Made the initial plan:
-# Rule based + RL or auto learner 
-# initial va fi rule based, sau dupa niste keywords 
-# iar companiile obvious vor primii label
-# in acelasi timp, ml ul invata din predictiile sale si cele date de rule based
-# dupa analizeaza nuantele din fiecare companie si la fel se invata
-# apoi in fucntie de bumarul de keywords uri gasite intr o companie ml ul va avea o influenta mai mare asupra deciziei finale
-# acesta poate adapta si regulile de baza (inca nu sunt sigur de asta)
-# dar pe scurt invata in timp ce le da label si analizeaza si nuantele 
-# iar datset ul nu e unul traditional ci invata pe masura ce analizeaza mai mult 
 
 
 #       STEP 1: Rule based
@@ -72,11 +61,11 @@ def label_count(labels):
     return len(labels)
 
 # un datadet mic de training
-# incerc un fel de invatare supervizata -> aduica consider ca dataset de invatare companiile care au una sau doua label-uri
+# incerc un fel de invatare supervizata -> adica consider ca dataset de invatare companiile care au una sau doua label-uri
 # am ales pana la doua label-uri ca sa am un dataset ul putin mai mare si poate ajuta si la 'nuantare' 
 train_df = insurance[insurance['initial_label'].apply(label_count).between(1, 2)]
 
-# toate albel-urile care apar in dataset
+# toate label-urile care apar in dataset
 all_labels = sorted(set([l for labels in train_df['initial_label'] for l in labels]))
 
 # transform label-urile intr-o matrice si scot datele pt training
@@ -91,6 +80,7 @@ y_train = mlb.fit_transform(y_train_lists)
 vectorizer = CountVectorizer()
 vectorizer.fit(x_train_texts)
 
+# antrenez un model de clasificare pt fiecare label
 classifiers = {}
 for i, label_name in enumerate(all_labels):
     clf = SGDClassifier(loss='log_loss')
@@ -102,6 +92,7 @@ for idx, label_name in enumerate(all_labels):
     classifiers[label_name].fit(X_train_vec, y_train_bin)
 
 # bag predictiile pt fiecare label intr-o matrice careia ii fac un f1_score
+# practic evaluarea initiala a modelului
 def evaluate_multilabel(classifiers, X, Y):
     preds = []
     for label_name in all_labels:
@@ -121,71 +112,107 @@ print("initial: ", model_trust)
 
 #       STEP 3: Prediction
 
-# compar probabilittatile si iau rezultatul cu cea mai buna probabilitate
-def predict_label_for_text(classifiers, text):
-    vec = vectorizer.transform([text])
-    best_label = None
-    best_prob = 0.0
+# clasa pentru a calcula increderea in model
+class TrustCalculator:
+    def __init__(self, initial_trust):
+        self.trust = initial_trust
+        self.best_success = 0.0
+        self.stale_count = 0
+        
+    def update(self, success_rate):
+        if success_rate > self.best_success:
+            improvement = success_rate - self.best_success
+            self.trust = min(1.0, self.trust + (improvement * 1.5))
+            self.best_success = success_rate
+            self.stale_count = 0
+        else:
+            decay = 0.05 + (self.stale_count * 0.01)
+            self.trust = max(0.3, self.trust - decay)
+            self.stale_count += 1
 
+trust_calculator = TrustCalculator(initial_trust=model_trust)
+
+# calcularea deciziei
+def decision(ml_label, ml_prob, keyword_labels, trust):
+    base_threshold = 0.65 - (trust * 0.15)
+    keyword_conf = len(keyword_labels) / (len(keyword_labels) + 2)
+    
+    ml_weight = np.tanh(trust * 3)
+    hybrid_score = (ml_weight * ml_prob) + ((1 - ml_weight) * keyword_conf)
+    
+    if hybrid_score > base_threshold + 0.15:
+        return ml_label
+    elif hybrid_score > base_threshold and keyword_labels:
+        return keyword_labels[0] if trust < 0.4 else ml_label
+    elif keyword_labels:
+        return keyword_labels[0]
+    else:
+        return ml_label
+
+# predictia in functie de increderea pe care o am in ml
+def predict_with_confidence(classifiers, text):
+    vec = vectorizer.transform([text])
+    confidences = {}
+    
     for label_name in all_labels:
         prob = classifiers[label_name].predict_proba(vec)[0][1]
-        if prob > best_prob:
-            best_label = label_name
-            best_prob = prob
-
-    return best_label, best_prob
-
-# decisia finala -> 1 label
-# cea mai buna predictie a ml-ului -> apoi numarul de keyword-uri si 'increderea modelului' -> decizia finala
-def final_decisions(classifiers, text, keyword_labels, trust):
-    best_label, best_prob = predict_label_for_text(classifiers, text)
-    keyword_count = len(keyword_labels)
-
-    if keyword_count == 0:
-        return best_label
-    if keyword_count == 1:
-        return best_label if trust > 0.6 else keyword_labels[0] 
-    if keyword_count == 2:
-        return best_label if trust > 0.7 else keyword_labels[0]
+        confidences[label_name] = prob
+    
+    best_label = max(confidences, key=confidences.get)
+    return best_label, confidences[best_label], confidences
 
 
-#       STEP 4: invatarea incrementala
+#       STEP 4: Learning and updating
 
-# vreau ca ml ul sa invete dupa fiecare linie (companie) si ii updatez increderea la chunk_size linii
 chunk_size = 50
 row_count = 0
 final_labels = []
+history_buffer = deque(maxlen=200)
 
 for idx, row in insurance.iterrows():
     text = row['company_text']
     kw = row['initial_label']
-
-    # 1 sau 2 label-uri date de keyword luate ca dataset
+    
+    best_label, best_prob, all_confs = predict_with_confidence(classifiers, text)
+    
+    final_label = decision(
+        ml_label=best_label,
+        ml_prob=best_prob,
+        keyword_labels=kw,
+        trust=trust_calculator.trust
+    )
+    
     if 1 <= len(kw) <= 2:
         xv = vectorizer.transform([text])
         y_bin = np.zeros(len(all_labels), dtype=int)
-
+        
         for lab in kw:
-            i = all_labels.index(lab)
-            y_bin[i] = 1
-
+            if lab in all_labels:
+                i = all_labels.index(lab)
+                y_bin[i] = 1
+        
         for i, lab in enumerate(all_labels):
             classifiers[lab].partial_fit(xv, [y_bin[i]], classes=[0,1])
-
-    # la fiecare chunk_size updatez increderea
+            
+        outcome = 1 if final_label == best_label else 0
+        history_buffer.append(outcome)
+    
     row_count += 1
-    if row_count % chunk_size == 0:
-        model_trust = evaluate_multilabel(classifiers, X_train_vec, y_train)
+    if row_count % chunk_size == 0 and history_buffer:
+        success_rate = np.mean(history_buffer)
 
-    # decizia finala pentru compania curenta
-    final_label = final_decisions(classifiers, text, kw, model_trust)
+        if len(history_buffer) == history_buffer.maxlen:
+            trend = np.polyfit(range(len(history_buffer)), history_buffer, 1)[0]
+            success_rate += trend * 2
+        
+        trust_calculator.update(success_rate)
+        print(f"Row {row_count} - Current trust: {trust_calculator.trust:.2f}")
+    
     final_labels.append(final_label)
-
-    print(f"row {idx}: label = {final_label}")
+    print(f"Row {idx}: Decision: {final_label}")
 
 insurance["final_label"] = final_labels
 
 
 #       STEP 5: output salvat in excel
-
 insurance.to_excel('insurance_labels.xlsx', index=False)
