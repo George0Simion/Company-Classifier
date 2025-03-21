@@ -65,10 +65,11 @@ def label_count(labels):
 # am ales pana la doua label-uri ca sa am un dataset ul putin mai mare si poate ajuta si la 'nuantare' 
 train_df = insurance[insurance['initial_label'].apply(label_count).between(1, 2)]
 
-# toate label-urile care apar in dataset
+# toate label-urile unice care apar in dataset
 all_labels = sorted(set([l for labels in train_df['initial_label'] for l in labels]))
 
-# transform label-urile intr-o matrice si scot datele pt training
+# transform label-urile intr-o matrice si scot datele pt training (folosind MultiLabelBinarizer)
+# practic matricea are 1 daca exista label si 0 altfel
 mlb = MultiLabelBinarizer(classes=all_labels)
 x_train_texts = train_df['company_text'].tolist()
 y_train_lists = train_df['initial_label'].tolist()
@@ -76,16 +77,17 @@ y_train_lists = train_df['initial_label'].tolist()
 # transform lista de label-uri intr-o matrice de aparitii
 y_train = mlb.fit_transform(y_train_lists)
 
-# transform textul intr-o matrice 
+# intializez un vectorizer pt a transforma textul intr-o matrice de frecventa a tokenilor
 vectorizer = CountVectorizer()
 vectorizer.fit(x_train_texts)
 
-# antrenez un model de clasificare pt fiecare label
+# un classifier pt fiecare label -> folosest sochastic gradient descent
 classifiers = {}
 for i, label_name in enumerate(all_labels):
     clf = SGDClassifier(loss='log_loss')
     classifiers[label_name] = clf
 
+# transform textul in vectori si antrenez fiecare classifier pt fiecare label
 X_train_vec = vectorizer.transform(x_train_texts)
 for idx, label_name in enumerate(all_labels):
     y_train_bin = y_train[:, idx]
@@ -115,30 +117,31 @@ print("initial: ", model_trust)
 # clasa pentru a calcula increderea in model
 class TrustCalculator:
     def __init__(self, initial_trust):
-        self.trust = initial_trust
-        self.best_success = 0.0
-        self.stale_count = 0
+        self.trust = initial_trust      # -> trustul curent
+        self.best_success = 0.0         # -> cea mai buna performanta
+        self.stale_count = 0            # -> iteratii fara improvement
         
     def update(self, success_rate):
-        if success_rate > self.best_success:
+        if success_rate > self.best_success:                            # -> daca am o performanta mai buna cresc trustul
             improvement = success_rate - self.best_success
             self.trust = min(1.0, self.trust + (improvement * 1.5))
             self.best_success = success_rate
             self.stale_count = 0
         else:
-            decay = 0.05 + (self.stale_count * 0.01)
+            decay = 0.05 + (self.stale_count * 0.01)                    # -> daca nu ascad trustul gradually
             self.trust = max(0.3, self.trust - decay)
             self.stale_count += 1
 
 trust_calculator = TrustCalculator(initial_trust=model_trust)
 
 # calcularea deciziei
+# ia in calcul predictia ml ului, trustul in el si label-urile gasite cu keyword matching
 def decision(ml_label, ml_prob, keyword_labels, trust):
     base_threshold = 0.65 - (trust * 0.15)
-    keyword_conf = len(keyword_labels) / (len(keyword_labels) + 2)
+    keyword_conf = len(keyword_labels) / (len(keyword_labels) + 2) # reprezinta o valoare care ne spune cat de mult ne putem increde in keyword matching + putin noise
     
-    ml_weight = np.tanh(trust * 3)
-    hybrid_score = (ml_weight * ml_prob) + ((1 - ml_weight) * keyword_conf)
+    ml_weight = np.tanh(trust * 3) # trustul in ml
+    hybrid_score = (ml_weight * ml_prob) + ((1 - ml_weight) * keyword_conf) # un scor hibrid
     
     if hybrid_score > base_threshold + 0.15:
         return ml_label
@@ -149,7 +152,8 @@ def decision(ml_label, ml_prob, keyword_labels, trust):
     else:
         return ml_label
 
-# predictia in functie de increderea pe care o am in ml
+# predictia cu incredere
+# vectorizez inputul si pentru fiecare label calculez probabilitatea
 def predict_with_confidence(classifiers, text):
     vec = vectorizer.transform([text])
     confidences = {}
@@ -164,17 +168,19 @@ def predict_with_confidence(classifiers, text):
 
 #       STEP 4: Learning and updating
 
-chunk_size = 50
+chunk_size = 50 # cand invata si updateaza trustul
 row_count = 0
 final_labels = []
-history_buffer = deque(maxlen=200)
+history_buffer = deque(maxlen=200) # buffer care retine cele mai recente 200 predictii
 
 for idx, row in insurance.iterrows():
     text = row['company_text']
     kw = row['initial_label']
     
+    # predictia cu incredere a ml ului
     best_label, best_prob, all_confs = predict_with_confidence(classifiers, text)
     
+    # decizia finala
     final_label = decision(
         ml_label=best_label,
         ml_prob=best_prob,
@@ -182,6 +188,7 @@ for idx, row in insurance.iterrows():
         trust=trust_calculator.trust
     )
     
+    # daca am 1 sau 2 label-uri in dataset ml ul invata folosind partial fit
     if 1 <= len(kw) <= 2:
         xv = vectorizer.transform([text])
         y_bin = np.zeros(len(all_labels), dtype=int)
@@ -191,6 +198,7 @@ for idx, row in insurance.iterrows():
                 i = all_labels.index(lab)
                 y_bin[i] = 1
         
+        # updatez classifier ul
         for i, lab in enumerate(all_labels):
             classifiers[lab].partial_fit(xv, [y_bin[i]], classes=[0,1])
             
@@ -201,18 +209,21 @@ for idx, row in insurance.iterrows():
     if row_count % chunk_size == 0 and history_buffer:
         success_rate = np.mean(history_buffer)
 
+        # daca am 200 de predictii in buffer calculez trendul si adjustez success rate ul
         if len(history_buffer) == history_buffer.maxlen:
             trend = np.polyfit(range(len(history_buffer)), history_buffer, 1)[0]
             success_rate += trend * 2
         
+        # updatez trustul
         trust_calculator.update(success_rate)
         print(f"Row {row_count} - Current trust: {trust_calculator.trust:.2f}")
     
     final_labels.append(final_label)
     print(f"Row {idx}: Decision: {final_label}")
 
-insurance["final_label"] = final_labels
+insurance["insurance_label"] = final_labels
 
 
 #       STEP 5: output salvat in excel
-insurance.to_excel('insurance_labels.xlsx', index=False)
+final_columns = ['description', 'business_tags', 'sector', 'category', 'niche', 'insurance_label']
+insurance[final_columns].to_excel('ml_insurance_challenge.xlsx', index=False)
